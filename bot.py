@@ -1,10 +1,12 @@
 import asyncio
 import functools
+import html
 import json
 import logging
 import secrets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters,
@@ -19,6 +21,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("bot")
 
 WAITING_TOKEN, WAITING_WORKSPACE, WAITING_LABEL, WAITING_IMPORT_FILE, WAITING_WORKSPACE_UPDATE = range(5)
+
+
+def esc(s) -> str:
+    return html.escape(str(s))
+
+
+def panel_message(panel: dict, account_label: str, extra: str = "") -> str:
+    """Shared HTML-formatted panel summary — password in <code> for tap-to-copy."""
+    return (
+        f"📦 <b>{esc(panel['label'])}</b>\nAccount: {esc(account_label)}\n\n"
+        f"🔗 https://{esc(panel['domain'])}/login\n"
+        f"🔑 <code>{esc(panel['admin_password'])}</code>{extra}"
+    )
 
 
 def owner_only(fn):
@@ -105,8 +120,28 @@ async def deploy_to_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    rows = [[InlineKeyboardButton(name, callback_data=f"deploy_region:{account_id}:{code}")] for code, name in config.REGIONS]
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="deploy_menu")])
+    await query.edit_message_text(
+        f"Deploying on {account['label']}. Pick a region:\n"
+        "(Railway lists region choice as a Pro-plan feature — may be ignored on Free/Trial.)",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+@owner_only
+async def deploy_to_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, account_id, region = query.data.split(":")
+    account_id = int(account_id)
+    account = db.get_account(account_id)
+    if account is None:
+        await query.edit_message_text("That account no longer exists.")
+        return
+
     await query.edit_message_text(f"Deploying on {account['label']}…\n\n⏳ Creating project…")
-    asyncio.create_task(run_deploy(account_id, query, context))
+    asyncio.create_task(run_deploy(account_id, region, query, context))
 
 
 async def _edit(query, text):
@@ -116,7 +151,7 @@ async def _edit(query, text):
         pass
 
 
-async def run_deploy(account_id: int, query, context: ContextTypes.DEFAULT_TYPE):
+async def run_deploy(account_id: int, region: str, query, context: ContextTypes.DEFAULT_TYPE):
     account = db.get_account(account_id)
     token = db.get_account_token(account_id)
     client = RailwayClient(token)
@@ -148,11 +183,24 @@ async def run_deploy(account_id: int, query, context: ContextTypes.DEFAULT_TYPE)
 
         service_id = await client.create_service_from_repo(project_id, "panel", config.TARGET_REPO, config.TARGET_BRANCH)
 
+        try:
+            await client.set_region(service_id, region)
+        except RailwayAPIError:
+            pass  # Pro-plan-only on many accounts — not a fatal error
+
         await _edit(query, f"Deploying on {account['label']}…\n\n✅ Service created\n⏳ Setting password…")
         admin_password = secrets.token_urlsafe(9)
         await client.set_variable(project_id, environment_id, service_id, "ADMIN_PASSWORD", admin_password)
 
-        await _edit(query, f"Deploying on {account['label']}…\n\n✅ Password set\n⏳ Generating domain…")
+        await _edit(query, f"Deploying on {account['label']}…\n\n✅ Password set\n⏳ Attaching storage…")
+        volume_ok = True
+        try:
+            await client.create_volume(project_id, environment_id, service_id, "/data")
+            await client.set_variable(project_id, environment_id, service_id, "DB_PATH", "/data/panel.db")
+        except RailwayAPIError:
+            volume_ok = False  # e.g. account already at its volume-per-project limit — deploy continues without it
+
+        await _edit(query, f"Deploying on {account['label']}…\n\n✅ Storage ready\n⏳ Generating domain…")
         domain = await client.create_domain(service_id, environment_id)
 
         await _edit(query, f"Deploying on {account['label']}…\n\n✅ Domain ready\n⏳ Building & deploying…")
@@ -177,12 +225,18 @@ async def run_deploy(account_id: int, query, context: ContextTypes.DEFAULT_TYPE)
                 healthy = True
                 break
 
-        db.add_panel(account_id, label, project_id, service_id, environment_id, domain, admin_password)
+        db.add_panel(account_id, label, project_id, service_id, environment_id, domain, admin_password, region)
+        panel = db.get_panel(db.list_panels_for_account(account_id)[-1]["id"])
 
-        note = "" if healthy else "\n\n⚠️ Deployed, but /health isn't responding yet — give it a minute and check again."
-        await _edit(
-            query,
-            f"✅ Deployed: {label}\n\n🔗 https://{domain}\n🔑 {admin_password}{note}",
+        note = ""
+        if not healthy:
+            note += "\n\n⚠️ Deployed, but /health isn't responding yet — give it a minute and check again."
+        if not volume_ok:
+            note += "\n\n⚠️ Couldn't attach persistent storage (account may be at its volume limit) — panel data will reset on redeploy."
+        await context.bot.edit_message_text(
+            chat_id=query.message.chat_id, message_id=query.message.message_id,
+            text=f"✅ Deployed: {esc(label)}\n\n{panel_message(dict(panel), account['label'])}{note}",
+            parse_mode=ParseMode.HTML,
         )
     except RailwayAPIError as e:
         kb = None
@@ -409,20 +463,25 @@ async def account_delete_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     account_id = int(account_id)
     account = db.get_account(account_id)
 
+    errors = []
     if mode == "wipe":
         token = db.get_account_token(account_id)
         client = RailwayClient(token)
-        errors = []
         for p in db.list_panels_for_account(account_id):
             try:
                 await client.delete_project(p["railway_project_id"])
             except RailwayAPIError as e:
-                errors.append(f"{p['label']}: {e}")
-        if errors:
-            await query.edit_message_text("Some panels failed to delete on Railway:\n" + "\n".join(errors) +
-                                           "\n\nRemoving the account from the bot anyway.")
+                errors.append(f"{esc(p['label'])}: {esc(e)}")
+
     db.delete_account(account_id)
-    await query.edit_message_text(f"Deleted account: {account['label']}", reply_markup=main_menu_kb())
+
+    text = f"✅ Deleted account: {esc(account['label'])}"
+    if mode == "wipe" and not errors:
+        text += " (all Railway projects removed)."
+    elif errors:
+        text += (".\n\n⚠️ Some panels failed to delete on Railway:\n" + "\n".join(errors) +
+                  "\nYou may need to delete them manually in the Railway dashboard.")
+    await query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
 
 
 # ── panels ──────────────────────────────────────────────────────────────
@@ -452,19 +511,20 @@ async def render_panel_detail(query, panel_id: int):
     account = db.get_account(panel["account_id"])
     alerts = "🔔 on" if panel["alerts_enabled"] else "🔕 off"
     health = "✅ ok (last check)" if panel["last_health_ok"] else "⚠️ down (last check)"
+    region = panel["region"] or "default"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Open Panel", url=f"https://{panel['domain']}")],
+        [InlineKeyboardButton("🔗 Open Panel", url=f"https://{panel['domain']}/login")],
         [InlineKeyboardButton("🔑 Rotate Password", callback_data=f"panel_rotate:{panel_id}")],
         [InlineKeyboardButton("🔄 Redeploy", callback_data=f"panel_redeploy:{panel_id}")],
         [InlineKeyboardButton(f"Alerts: {alerts} (tap to toggle)", callback_data=f"panel_toggle:{panel_id}")],
         [InlineKeyboardButton("🗑 Delete Panel", callback_data=f"panel_delete:{panel_id}")],
         [InlineKeyboardButton("⬅ Back", callback_data="panels_menu")],
     ])
+    extra = f"\n\nRegion: {esc(region)}\nHealth: {health}\nCreated: {panel['created_at'][:10]}"
     await query.edit_message_text(
-        f"📦 {panel['label']}\nAccount: {account['label'] if account else '?'}\n\n"
-        f"🔗 https://{panel['domain']}\n🔑 {panel['admin_password']}\n\n"
-        f"Health: {health}\nCreated: {panel['created_at'][:10]}",
+        panel_message(dict(panel), account["label"] if account else "?", extra),
         reply_markup=kb,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -502,8 +562,9 @@ async def panel_rotate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.update_panel_password(panel_id, new_password)
     await query.edit_message_text(
-        f"✅ Password rotated for {panel['label']}\n\n🔑 {new_password}",
+        f"✅ Password rotated for {esc(panel['label'])}\n\n🔑 <code>{esc(new_password)}</code>",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data=f"panel:{panel_id}")]]),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -558,10 +619,13 @@ async def panel_delete_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = RailwayClient(token)
     try:
         await client.delete_project(panel["railway_project_id"])
+        db.delete_panel(panel_id)
+        text = f"✅ Deleted panel: {esc(panel['label'])} (Railway project removed)."
     except RailwayAPIError as e:
-        await query.edit_message_text(f"Railway deletion failed ({e}) — removing from the bot anyway.")
-    db.delete_panel(panel_id)
-    await query.edit_message_text(f"Deleted panel: {panel['label']}", reply_markup=main_menu_kb())
+        db.delete_panel(panel_id)
+        text = (f"⚠️ Removed {esc(panel['label'])} from the bot, but Railway deletion failed: {esc(e)}\n"
+                "You may need to delete the project manually in the Railway dashboard.")
+    await query.edit_message_text(text, reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
 
 
 @owner_only
@@ -705,6 +769,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_main_callback, pattern="^main$"))
     app.add_handler(CallbackQueryHandler(deploy_menu, pattern="^deploy_menu$"))
     app.add_handler(CallbackQueryHandler(deploy_to_account, pattern="^deploy_to:"))
+    app.add_handler(CallbackQueryHandler(deploy_to_region, pattern="^deploy_region:"))
     app.add_handler(CallbackQueryHandler(cleanup_partial, pattern="^cleanup:"))
 
     app.add_handler(CallbackQueryHandler(accounts_menu, pattern="^accounts_menu$"))
