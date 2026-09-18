@@ -67,17 +67,29 @@ give it a label. The bot validates it live before saving.
 
 ## 6. Deploy a panel
 
-`/start` → `🚀 Deploy Panel` → pick the account → wait. You'll get back the
-panel's URL and its admin password when it finishes. Progress is shown live
-in the same message as it moves through each step.
+`/start` → `🚀 Deploy Panel` → pick the account → pick a region → wait. You'll
+get back the panel's login URL and its admin password when it finishes,
+tap-to-copy in Telegram. Progress is shown live in the same message as it
+moves through each step.
+
+Each deploy also attaches a 0.5GB volume to the panel automatically and
+points its `DB_PATH` at it, so the panel's own data survives redeploys —
+this closes the ephemeral-disk gap the panel project's README warned about.
+If your account is already at its volume limit, the deploy still succeeds
+but tells you storage wasn't attached.
 
 ## Notes
 
-- **Bot data persistence**: like the panel itself, this bot's own SQLite DB
-  sits on Railway's ephemeral disk and can be wiped on redeploy. Use
-  `💾 Backup / Import` periodically — export saves a JSON file with all
-  accounts (tokens still encrypted) and panels; import restores it on a
-  fresh deploy, provided `ENCRYPTION_KEY` matches.
+- **Bot data persistence**: attach a volume to the *bot's own* Railway
+  service (Settings → Volumes, any mount path) and it's picked up
+  automatically — no env var needed, since Railway sets
+  `RAILWAY_VOLUME_MOUNT_PATH` for you and the bot checks for it. Without a
+  volume, `bot.db` sits on ephemeral disk and can be wiped on redeploy;
+  use `💾 Backup / Import` as a second line of defense either way.
+- **Region selection**: Railway's own docs list per-service region choice
+  as a Pro-plan feature. The bot still sends the request on every deploy
+  since it's harmless to try — on a Free/Trial account it may simply be
+  ignored and the panel deploys to Railway's default region instead.
 - **Health sweep**: runs every `HEALTH_SWEEP_INTERVAL_HOURS` (default 24h)
   and only messages you when a panel's or account's status *changes* —
   not on every sweep — so it won't spam you while something stays down.
@@ -86,3 +98,8 @@ in the same message as it moves through each step.
 - **Account deletion**: if the account still has panels, you're asked
   whether to delete those panels' Railway projects too, or just remove the
   account from the bot and leave them running.
+- **Workspace ID**: Railway currently requires a Workspace ID to create
+  new projects on most accounts, with no reliable way for the bot to look
+  it up on its own — that's a Railway platform limitation as of writing,
+  not something this bot can smooth over further. Get yours once via
+  Ctrl/Cmd+K → "Copy Active Workspace ID" in the dashboard.
