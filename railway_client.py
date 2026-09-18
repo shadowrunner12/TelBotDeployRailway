@@ -133,6 +133,20 @@ class RailwayClient:
         )
         return data["volumeCreate"]["id"]
 
+    async def list_deployments(self, project_id: str, environment_id: str, service_id: str, first: int = 10) -> list:
+        data = await self._call(
+            "query deployments($input: DeploymentListInput!, $first: Int) { "
+            "deployments(input: $input, first: $first) { edges { node { id status } } } }",
+            {"input": {"projectId": project_id, "environmentId": environment_id, "serviceId": service_id}, "first": first},
+        )
+        return [e["node"] for e in data["deployments"]["edges"]]
+
+    async def cancel_deployment(self, deployment_id: str):
+        await self._call(
+            "mutation deploymentCancel($id: String!) { deploymentCancel(id: $id) }",
+            {"id": deployment_id},
+        )
+
     async def create_domain(self, service_id: str, environment_id: str) -> str:
         data = await self._call(
             "mutation serviceDomainCreate($input: ServiceDomainCreateInput!) { "
