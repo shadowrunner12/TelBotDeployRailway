@@ -158,7 +158,7 @@ async def run_deploy(account_id: int, region: str, query, context: ContextTypes.
     project_id = None
     try:
         n = db.count_panels_for_account(account_id) + 1
-        project_name = f"vpn-panel-{secrets.token_hex(3)}"
+        project_name = f"app-{secrets.token_hex(4)}"
         label = f"panel-{n}"
 
         workspace_id = account["workspace_id"]
@@ -182,6 +182,27 @@ async def run_deploy(account_id: int, region: str, query, context: ContextTypes.
         environment_id = environments[0]["node"]["id"]
 
         service_id = await client.create_service_from_repo(project_id, "panel", config.TARGET_REPO, config.TARGET_BRANCH)
+
+        # Connecting a GitHub repo auto-triggers an initial deploy immediately.
+        # If we set the region or attach a volume while that's still building,
+        # the later explicit deploy's volume migration collides with it. So:
+        # cancel anything non-terminal here before touching region/volume.
+        await _edit(query, f"Deploying on {account['label']}…\n\n✅ Service created\n⏳ Clearing auto-started build…")
+        for _ in range(6):
+            try:
+                deployments = await client.list_deployments(project_id, environment_id, service_id)
+            except RailwayAPIError:
+                break
+            pending = [d for d in deployments if d["status"] in
+                       ("QUEUED", "INITIALIZING", "BUILDING", "DEPLOYING", "WAITING", "NEEDS_APPROVAL")]
+            if not pending:
+                break
+            for d in pending:
+                try:
+                    await client.cancel_deployment(d["id"])
+                except RailwayAPIError:
+                    pass
+            await asyncio.sleep(3)
 
         try:
             await client.set_region(service_id, region)
