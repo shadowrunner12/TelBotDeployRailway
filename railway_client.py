@@ -116,6 +116,23 @@ class RailwayClient:
         )
         return data["deployment"]["status"]
 
+    async def set_region(self, service_id: str, region: str):
+        """Best-effort — Railway's docs list region selection as a Pro-plan
+        feature, so this may silently have no effect on Free/Trial accounts."""
+        await self._call(
+            "mutation serviceInstanceUpdate($input: ServiceInstanceUpdateInput!, $serviceId: String!) { "
+            "serviceInstanceUpdate(input: $input, serviceId: $serviceId) }",
+            {"serviceId": service_id, "input": {"multiRegionConfig": {region: {"numReplicas": 1}}}},
+        )
+
+    async def create_volume(self, project_id: str, environment_id: str, service_id: str, mount_path: str) -> str:
+        data = await self._call(
+            "mutation volumeCreate($input: VolumeCreateInput!) { volumeCreate(input: $input) { id name } }",
+            {"input": {"projectId": project_id, "environmentId": environment_id,
+                       "serviceId": service_id, "mountPath": mount_path}},
+        )
+        return data["volumeCreate"]["id"]
+
     async def create_domain(self, service_id: str, environment_id: str) -> str:
         data = await self._call(
             "mutation serviceDomainCreate($input: ServiceDomainCreateInput!) { "
