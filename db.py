@@ -9,7 +9,20 @@ from datetime import datetime, timezone
 
 import crypto
 
-DB_PATH = os.environ.get("BOT_DB_PATH", "bot.db")
+def _resolve_db_path() -> str:
+    explicit = os.environ.get("BOT_DB_PATH")
+    if explicit:
+        return explicit
+    # If a volume is attached to this service, Railway sets this automatically —
+    # use it so persistence "just works" once a volume is attached, no other
+    # env var needed. Falls back to ephemeral local disk otherwise.
+    mount = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    if mount:
+        return os.path.join(mount, "bot.db")
+    return "bot.db"
+
+
+DB_PATH = _resolve_db_path()
 
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.execute("PRAGMA journal_mode=WAL")
@@ -43,11 +56,14 @@ def init_db():
         """
     )
     _db.commit()
-    # migrate older DBs created before workspace_id existed
-    cols = [r["name"] for r in _db.execute("PRAGMA table_info(accounts)").fetchall()]
-    if "workspace_id" not in cols:
+    # migrate older DBs created before these columns existed
+    acc_cols = [r["name"] for r in _db.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "workspace_id" not in acc_cols:
         _db.execute("ALTER TABLE accounts ADD COLUMN workspace_id TEXT")
-        _db.commit()
+    panel_cols = [r["name"] for r in _db.execute("PRAGMA table_info(panels)").fetchall()]
+    if "region" not in panel_cols:
+        _db.execute("ALTER TABLE panels ADD COLUMN region TEXT")
+    _db.commit()
 
 
 def now() -> str:
@@ -102,12 +118,12 @@ def count_panels_for_account(account_id: int) -> int:
 # ── panels ──────────────────────────────────────────────────────────────
 
 def add_panel(account_id: int, label: str, project_id: str, service_id: str,
-              environment_id: str, domain: str, admin_password: str) -> int:
+              environment_id: str, domain: str, admin_password: str, region: str | None = None) -> int:
     cur = _db.execute(
         "INSERT INTO panels (account_id, label, railway_project_id, railway_service_id, "
-        "railway_environment_id, domain, admin_password, alerts_enabled, last_health_ok, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)",
-        (account_id, label, project_id, service_id, environment_id, domain, admin_password, now()),
+        "railway_environment_id, domain, admin_password, alerts_enabled, last_health_ok, region, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
+        (account_id, label, project_id, service_id, environment_id, domain, admin_password, region, now()),
     )
     _db.commit()
     return cur.lastrowid
@@ -181,11 +197,11 @@ def import_all(blob: str, wipe_existing: bool = False):
             continue
         _db.execute(
             "INSERT INTO panels (account_id, label, railway_project_id, railway_service_id, "
-            "railway_environment_id, domain, admin_password, alerts_enabled, last_health_ok, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "railway_environment_id, domain, admin_password, alerts_enabled, last_health_ok, region, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (new_account_id, p["label"], p["railway_project_id"], p["railway_service_id"],
              p["railway_environment_id"], p["domain"], p["admin_password"],
-             p["alerts_enabled"], p["last_health_ok"], p["created_at"]),
+             p["alerts_enabled"], p["last_health_ok"], p.get("region"), p["created_at"]),
         )
         imported_panels += 1
 
